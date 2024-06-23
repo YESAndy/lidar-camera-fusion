@@ -40,6 +40,7 @@ typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 //Publisher
 ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
+ros::Publisher lidar_depth_pub;
 
 
 float maxlen =100.0;       //maxima distancia del lidar
@@ -62,28 +63,28 @@ double max_var = 50.0;
 float interpol_value = 20.0;
 
 bool f_pc = true; 
+bool pub_pcOnImg = false;
 
 // input topics 
 std::string imgTopic = "/camera/color/image_raw";
+std::string depthTopic = "/camera/depth/image_rect_raw";
 std::string pcTopic = "/velodyne_points";
 
 //matrix calibration lidar and camera
 
 Eigen::MatrixXf Tlc(3,1); // translation matrix lidar-camera
+Eigen::MatrixXf Tlc_c2d(3,1); // translation matrix lidar-camera
 Eigen::MatrixXf Rlc(3,3); // rotation matrix lidar-camera
 Eigen::MatrixXf Mc(3,4);  // camera calibration matrix
+Eigen::MatrixXf Dc(5,1); // camera distortion coefficient 
 
 // range image parametros
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
 
-
-
 ///////////////////////////////////////callback
 
-
-
-void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , const ImageConstPtr& in_image)
+void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , const ImageConstPtr& in_image, const ImageConstPtr& in_depth)
 {
     cv_bridge::CvImagePtr cv_ptr , color_pcl;
         try
@@ -96,6 +97,16 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
           ROS_ERROR("cv_bridge exception: %s", e.what());
           return;
         }
+
+    cv_bridge::CvImagePtr cv_ptr_depth;
+    try{
+        cv_ptr_depth = cv_bridge::toCvCopy(*in_depth, sensor_msgs::image_encodings::TYPE_16UC1);
+    }
+    catch (cv_bridge::Exception& e)
+    {
+        ROS_ERROR("cv_bridge exception:  %s", e.what());
+        return;
+    }
 
   //Conversion from sensor_msgs::PointCloud2 to pcl::PointCloud<T>
   pcl::PCLPointCloud2 pcl_pc2;
@@ -325,12 +336,20 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
   P_out = cloud;
 
-
   Eigen::MatrixXf RTlc(4,4); // translation matrix lidar-camera
   RTlc<<   Rlc(0), Rlc(3) , Rlc(6) ,Tlc(0)
           ,Rlc(1), Rlc(4) , Rlc(7) ,Tlc(1)
           ,Rlc(2), Rlc(5) , Rlc(8) ,Tlc(2)
           ,0       , 0        , 0  , 1    ;
+  Eigen::MatrixXf RTlc_c2d(4,4); // translation matrix lidar-camera
+  // RTlc_c2d<<   Rlc(0), Rlc(3) , Rlc(6) ,Tlc(0)+Tlc_c2d(1)
+  //             ,Rlc(1), Rlc(4) , Rlc(7) ,Tlc(1)+Tlc_c2d(1)
+  //             ,Rlc(2), Rlc(5) , Rlc(8) ,Tlc(2)+Tlc_c2d(1)
+  //             ,0       , 0        , 0  , 1    ;
+  RTlc_c2d<<   1, 0 , 0 ,Tlc_c2d(0)
+              ,0, 1 , 0 ,Tlc_c2d(1)
+              ,0, 0 , 1 ,Tlc_c2d(2)
+              ,0, 0 , 0 ,1         ;
 
   //std::cout<<RTlc<<std::endl;
 
@@ -338,14 +357,21 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
   Eigen::MatrixXf Lidar_camera(3,size_inter_Lidar);
   Eigen::MatrixXf Lidar_cam(3,1);
+  Eigen::MatrixXf Lidar_cam_depth(3,1);
   Eigen::MatrixXf pc_matrix(4,1);
   Eigen::MatrixXf pointCloud_matrix(4,size_inter_Lidar);
+  // Eigen::MatrixXf distorted_lidar_cam(3,1);
+  cv::Mat depth_32FC1;
+
+  cv_ptr_depth->image.convertTo(depth_32FC1, CV_32FC1);
 
   unsigned int cols = in_image->width;
   unsigned int rows = in_image->height;
-
+  double k1 = Dc(0,0), k2 = Dc(1,0), k3 = Dc(2,0);
+  double p1 = Dc(3,0), p2 = Dc(4,0);
   uint px_data = 0; uint py_data = 0;
-
+  uint px_data_depth = 0; uint py_data_depth = 0;
+  // std::cout << "dc: " << Dc << std::endl;
 
   pcl::PointXYZRGB point;
 
@@ -353,52 +379,112 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
    //P_out = cloud_out;
 
-  for (int i = 0; i < size_inter_Lidar; i++)
-  {
-      pc_matrix(0,0) = -P_out->points[i].y;   
-      pc_matrix(1,0) = -P_out->points[i].z;   
-      pc_matrix(2,0) =  P_out->points[i].x;  
-      pc_matrix(3,0) = 1.0;
+  if (pub_pcOnImg){
+    for (int i = 0; i < size_inter_Lidar; i++){   
+      // calculate color pix coordinate
+        pc_matrix(0,0) = P_out->points[i].x;   
+        pc_matrix(1,0) = P_out->points[i].y;   
+        pc_matrix(2,0) = P_out->points[i].z;  
+        pc_matrix(3,0) = 1.0;
 
-      Lidar_cam = Mc * (RTlc * pc_matrix);
+        Lidar_cam = Mc * (RTlc * pc_matrix);
+        px_data = (int)(Lidar_cam(0,0) / Lidar_cam(2,0));
+        py_data = (int)(Lidar_cam(1,0) / Lidar_cam(2,0));
+        // Lidar_cam = RTlc * pc_matrix;
 
-      px_data = (int)(Lidar_cam(0,0)/Lidar_cam(2,0));
-      py_data = (int)(Lidar_cam(1,0)/Lidar_cam(2,0));
-      
-      if(px_data<0.0 || px_data>=cols || py_data<0.0 || py_data>=rows)
-          continue;
+        // // add distortion from https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html
+        // double x_prime = Lidar_cam(0,0) / Lidar_cam(2,0);
+        // double y_prime = Lidar_cam(1,0) / Lidar_cam(2,0);
+        
+        // double r = x_prime * x_prime + y_prime * y_prime;
+        // double radial_distortion = 1 + k1 * r + k2 * r * r + k3 * r * r * r;
+        // double tangential_distortion_x = 2 * p1 * x_prime * y_prime + p2 * (r + 2 * x_prime * x_prime);
+        // double tangential_distortion_y = p1 * (r + 2 * y_prime * y_prime) + 2 * p2 * x_prime * y_prime;
 
-      int color_dis_x = (int)(255*((P_out->points[i].x)/maxlen));
-      int color_dis_z = (int)(255*((P_out->points[i].x)/10.0));
-      if(color_dis_z>255)
-          color_dis_z = 255;
+        // double x_prime_prime = x_prime * radial_distortion + tangential_distortion_x;
+        // double y_prime_prime = y_prime * radial_distortion + tangential_distortion_y;
+
+        // px_data = (int)(Mc(0,0) * x_prime_prime + Mc(0,2));
+        // py_data = (int)(Mc(1,1) * y_prime_prime + Mc(1,2));
+
+        // calculate depth pix coordinate
+        Lidar_cam_depth = Mc * ((RTlc * RTlc_c2d) * pc_matrix);
+        px_data_depth = (int)(Lidar_cam_depth(0,0) / Lidar_cam_depth(2,0));
+        py_data_depth = (int)(Lidar_cam_depth(1,0) / Lidar_cam_depth(2,0));
+        // Lidar_cam_depth = (RTlc * RTlc_c2d) * pc_matrix;
+
+        // double x_prime_depth = Lidar_cam_depth(0,0) / Lidar_cam_depth(2,0);
+        // double y_prime_depth = Lidar_cam_depth(1,0) / Lidar_cam_depth(2,0);
+        // double r_depth = x_prime_depth * x_prime_depth + y_prime_depth * y_prime_depth;
+        // double radial_distortion_depth = 1 + k1 * r_depth + k2 * r_depth * r_depth + k3 * r_depth * r_depth * r_depth;
+        // double tangential_distortion_x_depth = 2 * p1 * x_prime_depth * y_prime_depth + p2 * (r_depth + 2 * x_prime_depth * x_prime_depth);
+        // double tangential_distortion_y_depth = p1 * (r_depth + 2 * y_prime_depth * y_prime_depth) + 2 * p2 * x_prime_depth * y_prime_depth;
+        // double x_prime_prime_depth = x_prime_depth * radial_distortion_depth + tangential_distortion_x_depth;
+        // double y_prime_prime_depth = y_prime_depth * radial_distortion_depth + tangential_distortion_y_depth;
+
+        // px_data_depth = (int)(Mc(0,0) * x_prime_prime_depth + Mc(0,2));
+        // py_data_depth = (int)(Mc(1,1) * y_prime_prime_depth + Mc(1,2));
+        
+        if(px_data<0.0 || px_data>=cols || py_data<0.0 || py_data>=rows)
+            // std::cout << "x_distorted: " << px_data << ", y_distorted: " << py_data << std::endl;
+            continue;
+        
+        if(px_data_depth<0.0 || px_data_depth>=cols || py_data_depth<0.0 || py_data_depth>=rows)
+            // std::cout << "x_distorted: " << px_data << ", y_distorted: " << py_data << std::endl;
+            continue;
+
+        int color_dis_x = (int)(255*((P_out->points[i].z)/maxlen));
+        int color_dis_z = (int)(255*((P_out->points[i].z)/10.0));
+        if(color_dis_z>255)
+            color_dis_z = 255;
 
 
-      //point cloud con color
-      cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data,px_data);
+        //point cloud con color
+        cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data,px_data);
 
-      point.x = P_out->points[i].x;
-      point.y = P_out->points[i].y;
-      point.z = P_out->points[i].z;
-      
+        point.x = P_out->points[i].x;
+        point.y = P_out->points[i].y;
+        point.z = P_out->points[i].z;
+        
+        point.r = (int)color[2]; 
+        point.g = (int)color[1]; 
+        point.b = (int)color[0];
 
-      point.r = (int)color[2]; 
-      point.g = (int)color[1]; 
-      point.b = (int)color[0];
+        pc_color->points.push_back(point);   
 
-      
-      pc_color->points.push_back(point);   
-      
-      cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255-color_dis_x,(int)(color_dis_z),color_dis_x),cv::FILLED);
-      
+        // convert float to uint16
+        depth_32FC1.at<cv::Vec3b>(py_data_depth,px_data_depth) = P_out->points[i].z;
+        
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255-color_dis_x,(int)(color_dis_z),color_dis_x),cv::FILLED);
+        
+      }
+    pc_color->is_dense = true;
+    pc_color->width = (int) pc_color->points.size();
+    pc_color->height = 1;
+    pc_color->header.frame_id = "velodyne";
+
+    depth_32FC1.convertTo(cv_ptr_depth->image, CV_16UC1);
+
+    pcOnimg_pub.publish(cv_ptr->toImageMsg());
+    pc_pub.publish (pc_color);
+    lidar_depth_pub.publish (cv_ptr_depth->toImageMsg());
+  }
+  else {
+    for (int i = 0; i < size_inter_Lidar; i++){
+        point.x = P_out->points[i].x;
+        point.y = P_out->points[i].y;
+        point.z = P_out->points[i].z;
+
+        pc_color->points.push_back(point); 
+
     }
     pc_color->is_dense = true;
     pc_color->width = (int) pc_color->points.size();
     pc_color->height = 1;
     pc_color->header.frame_id = "velodyne";
 
-  pcOnimg_pub.publish(cv_ptr->toImageMsg());
-  pc_pub.publish (pc_color);
+    pc_pub.publish (pc_color);
+  }
 
 }
 
@@ -417,6 +503,7 @@ int main(int argc, char** argv)
   nh.getParam("/min_ang_FOV", min_FOV);
   nh.getParam("/pcTopic", pcTopic);
   nh.getParam("/imgTopic", imgTopic);
+  nh.getParam("/depthTopic", depthTopic);
   nh.getParam("/max_var", max_var);  
   nh.getParam("/filter_output_pc", f_pc);
 
@@ -424,12 +511,18 @@ int main(int argc, char** argv)
   nh.getParam("/y_interpolation", interpol_value);
 
   nh.getParam("/ang_Y_resolution", angular_resolution_y);
-  
+
+  nh.getParam("/pub_pcOnImg", pub_pcOnImg);
 
   XmlRpc::XmlRpcValue param;
 
   nh.getParam("/matrix_file/tlc", param);
   Tlc <<  (double)param[0]
+         ,(double)param[1]
+         ,(double)param[2];
+
+  nh.getParam("/matrix_file/tlc_c2d", param);
+  Tlc_c2d <<  (double)param[0]
          ,(double)param[1]
          ,(double)param[2];
 
@@ -446,16 +539,24 @@ int main(int argc, char** argv)
          ,(double)param[4] ,(double)param[5] ,(double)param[6] ,(double)param[7]
          ,(double)param[8] ,(double)param[9] ,(double)param[10],(double)param[11];
 
+  nh.getParam("/matrix_file/dc", param);
+
+
+  Dc <<  (double)param[0] ,(double)param[1] ,(double)param[2]
+         ,(double)param[3] ,(double)param[4];
+
   message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic , 1);
   message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);
+  message_filters::Subscriber<Image> depth_sub(nh, depthTopic, 1);
 
-  typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
-  Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
-  sync.registerCallback(boost::bind(&callback, _1, _2));
+  typedef sync_policies::ApproximateTime<PointCloud2, Image, Image> MySyncPolicy;
+  Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub, depth_sub);
+  sync.registerCallback(boost::bind(&callback, _1, _2, _3));
   pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
   rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
 
-  pc_pub = nh.advertise<PointCloud> ("/points2", 1);  
-
+  pc_pub = nh.advertise<PointCloud> ("/points2", 10);  
+  lidar_depth_pub = nh.advertise<sensor_msgs::Image>("/lidar_depth", 1); 
+  ros::Rate loop_rate(10);
   ros::spin();
 }
